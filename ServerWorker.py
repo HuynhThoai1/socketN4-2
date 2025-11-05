@@ -39,7 +39,8 @@ class ServerWorker:
 	def processRtspRequest(self, data):
 		"""Process RTSP request sent from the client."""
 		# Get the request type
-		request = data.split('\n')
+		request = data.decode().split('\n')
+
 		line1 = request[0].split(' ')
 		requestType = line1[0]
 		
@@ -152,7 +153,8 @@ class ServerWorker:
 			#print "200 OK"
 			reply = 'RTSP/1.0 200 OK\nCSeq: ' + seq + '\nSession: ' + str(self.clientInfo['session'])
 			connSocket = self.clientInfo['rtspSocket'][0]
-			connSocket.send(reply)
+			connSocket.send(reply.encode())
+
 		
 		# Error messages
 		elif code == self.FILE_NOT_FOUND_404:

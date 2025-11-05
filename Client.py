@@ -220,7 +220,8 @@ class Client:
 			return
 		
 		# Send the RTSP request using rtspSocket.
-		self.rtspSocket.send(request)
+		self.rtspSocket.send(request.encode())
+
 		
 		print ('\nData Sent:\n' + request)
 	
@@ -240,7 +241,8 @@ class Client:
 	
 	def parseRtspReply(self, data):
 		"""Parse the RTSP reply from the server."""
-		lines = data.split('\n')
+		lines = data.decode().split('\n')
+
 		seqNum = int(lines[1].split(' ')[1])
 		
 		# Process only if the server reply's sequence number is the same as the request's
