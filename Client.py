@@ -1,9 +1,10 @@
 from tkinter import *
 import tkinter.messagebox as messagebox
 from PIL import Image, ImageTk
-import socket, threading, sys, traceback, os, io
+import socket, threading, sys, traceback, os, io,time
 
 from RtpPacket import RtpPacket
+from ClientSideCaching import ClientSideCaching
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
@@ -41,6 +42,11 @@ class Client:
         self.connectToServer()
         self.frameNbr = 0
 
+        self.cache = ClientSideCaching()
+        self.targetFrames = 200
+        self.cachedFrames = 0
+        self.isSeeking = False
+
         # Buffer để chứa các mảnh của frame đang nhận
         self.currentFrameBuffer = bytearray()
         # last received RTP sequence (per-fragment)
@@ -54,25 +60,70 @@ class Client:
         self.setup = Button(self.master, width=20, padx=3, pady=3)
         self.setup["text"] = "Setup"
         self.setup["command"] = self.setupMovie
-        self.setup.grid(row=1, column=0, padx=2, pady=2)
+        self.setup.grid(row=2, column=0, padx=2, pady=2)
 
         self.start = Button(self.master, width=20, padx=3, pady=3)
         self.start["text"] = "Play"
         self.start["command"] = self.playMovie
-        self.start.grid(row=1, column=1, padx=2, pady=2)
+        self.start.grid(row=2, column=1, padx=2, pady=2)
 
         self.pause = Button(self.master, width=20, padx=3, pady=3)
         self.pause["text"] = "Pause"
         self.pause["command"] = self.pauseMovie
-        self.pause.grid(row=1, column=2, padx=2, pady=2)
+        self.pause.grid(row=2, column=2, padx=2, pady=2)
 
         self.teardown = Button(self.master, width=20, padx=3, pady=3)
         self.teardown["text"] = "Teardown"
         self.teardown["command"] =  self.exitClient
-        self.teardown.grid(row=1, column=3, padx=2, pady=2)
+        self.teardown.grid(row=2, column=3, padx=2, pady=2)
 
         self.label = Label(self.master, height=19)
         self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5)
+
+        self.createSeekBar()
+
+
+    def createSeekBar(self):
+        """Create Seek bar."""
+        self.seekFrame=Frame(self.master)
+        self.seekFrame.grid(row=1, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
+
+        self.seekFrame.grid_columnconfigure(0, weight=0)  # Label bên trái (nếu có)
+        self.seekFrame.grid_columnconfigure(1, weight=1)  # Seekbar mở rộng
+        self.seekFrame.grid_columnconfigure(2, weight=0)  # Label bên phải (nếu có)
+
+        self.seekBar=Scale(
+            self.seekFrame,
+            from_=0,
+            to=4389,
+            orient=HORIZONTAL,
+            showvalue=False
+        )
+
+        self.seekBar.grid(row=0, column=1, sticky="ew", padx=5)
+
+        self.seekBar.bind('<ButtonPress-1>', self.onSeekStart)  # Khi nhấn chuột
+        self.seekBar.bind('<ButtonRelease-1>', self.onSeekEnd)  # Khi thả chuột
+        self.seekBar.bind('<B1-Motion>', self.onSeeking)  # Khi đang kéo
+
+    def onSeekStart(self,event=None):
+        """Seek frame."""
+        if not self.isSeeking:
+            self.isSeeking=True
+            self.pauseMovie()
+
+    def onSeekEnd(self,event=None):
+        if self.isSeeking and self.state == self.READY:
+            self.isSeeking=False
+            self.playMovie()
+
+    def onSeeking(self,event=None):
+        self.frameNbr=self.seekBar.get()
+        print("frameNbr:",self.frameNbr)
+        dataFrame=self.cache.getFrame(self.frameNbr,self.sessionId)
+
+        if dataFrame:
+            self.updateMovie(self.writeFrame(dataFrame))
 
     def setupMovie(self):
         if self.state == self.INIT:
@@ -102,12 +153,20 @@ class Client:
             self.sendRtspRequest(self.PAUSE)
 
     def playMovie(self):
+        """Play button handler."""
         if self.state == self.READY:
-            # start listening thread
+            self.sendRtspRequest(self.PLAY)
+            # Create a new thread to listen for RTP packets
+            receiving_thread = threading.Thread(target=self.listenRtp)
+            receiving_thread.daemon = True
+            receiving_thread.start()
+
+            display_thread = threading.Thread(target=self.displayFrames)
+            display_thread.daemon = True
+            display_thread.start()
+
             self.playEvent = threading.Event()
             self.playEvent.clear()
-            threading.Thread(target=self.listenRtp, daemon=True).start()
-            self.sendRtspRequest(self.PLAY)
 
     def listenRtp(self):
         """Listen for RTP packets and assemble fragments into complete JPEG frames.
@@ -140,18 +199,19 @@ class Client:
 
                 # Append to current frame buffer
                 self.currentFrameBuffer.extend(payload)
-
                 # Determine marker bit from raw packet (byte 1: flags, marker is MSB)
                 is_last_packet = (data[1] >> 7) & 1
 
+
                 if is_last_packet:
                     # Completed a frame: decode from bytes (no intermediate file required)
+                    self.cachedFrames+=1
                     frame_bytes = bytes(self.currentFrameBuffer)
                     # Reset buffer for next frame
                     self.currentFrameBuffer = bytearray()
 
                     # Update GUI (use BytesIO to avoid file corruption issues)
-                    self.updateMovieFromBytes(frame_bytes)
+                    self.cache.cacheFrame(self.cachedFrames, self.sessionId, frame_bytes)
 
             except socket.timeout:
                 # periodic timeout to allow checking playEvent/teardown
@@ -171,6 +231,31 @@ class Client:
                     except Exception:
                         pass
                     break
+
+    def displayFrames(self):
+        """Display frame."""
+        count = 0
+        while (self.state != self.PLAYING and count < 10):
+            time.sleep(0.01)
+            count += 1
+
+        while self.cachedFrames < self.targetFrames and self.state == self.PLAYING:
+            time.sleep(0.01)
+
+        while self.state == self.PLAYING:
+            nextFrame = self.frameNbr + 1
+            dataFrame = self.cache.getFrame(nextFrame, self.sessionId)
+
+
+            if dataFrame:
+                self.frameNbr = nextFrame
+                self.updateMovieFromBytes(dataFrame)
+
+                self.seekBar.set(self.frameNbr)
+            else:
+                time.sleep(0.05)
+
+            time.sleep(0.033)
 
     def writeFrame(self, data):
         """Maintain backward compatibility: write frame to cache file and return filename."""
